@@ -38,6 +38,10 @@ bool RIGHT_REVERSED = false;
 // Calibrated forward speed from the motor bring-up test.
 const int BASE_DRIVE_PWM = 170;
 
+// GPIO2 is both the ESP32 built-in LED and the right L298 ENA pin.
+const int STOP_STATUS_LED_PIN = 2;
+const unsigned long STOP_BLINK_INTERVAL_MS = 100;
+
 // Centering PID gains. Correction is in PWM units.
 // Increase Kd to reduce oscillation. Increase Ki to correct steady-state bias.
 const float PID_KP = 8.0f;
@@ -74,14 +78,71 @@ const uint8_t LEFT_PWM_CHANNEL = 1;
 // =====================================================
 
 const float SOUND_SPEED_CM_PER_US = 0.0343f;
-const unsigned long ECHO_TIMEOUT_US = 25000;
+const float SENSOR_ERROR_DISTANCE_CM = -1.0f;
+const float MAX_VALID_DISTANCE_CM = 20.0f;
+const unsigned long ECHO_TIMEOUT_US = 1000;
 const unsigned long SENSOR_SETTLE_MS = 30;
+const uint8_t MOVING_AVERAGE_SAMPLES = 10;
 
 struct SensorReadings {
   float leftCm;
   float frontCm;
   float rightCm;
 };
+
+class MovingAverageFilter {
+ public:
+  MovingAverageFilter()
+      : nextIndex_(0), sampleCount_(0), sum_(0.0f) {}
+
+  float update(float readingCm) {
+    if (!isValidDistance(readingCm)) {
+      return SENSOR_ERROR_DISTANCE_CM;
+    }
+
+    return addSample(readingCm);
+  }
+
+  float updateError(float error) {
+    return addSample(error);
+  }
+
+  void reset() {
+    nextIndex_ = 0;
+    sampleCount_ = 0;
+    sum_ = 0.0f;
+  }
+
+ private:
+  float addSample(float reading) {
+    if (sampleCount_ < MOVING_AVERAGE_SAMPLES) {
+      samples_[sampleCount_] = reading;
+      sum_ += reading;
+      sampleCount_++;
+    } else {
+      sum_ -= samples_[nextIndex_];
+      samples_[nextIndex_] = reading;
+      sum_ += reading;
+      nextIndex_ = (nextIndex_ + 1) % MOVING_AVERAGE_SAMPLES;
+    }
+
+    return sum_ / sampleCount_;
+  }
+
+  static bool isValidDistance(float readingCm) {
+    return readingCm > 0.0f && readingCm <= MAX_VALID_DISTANCE_CM;
+  }
+
+  float samples_[MOVING_AVERAGE_SAMPLES] = {};
+  uint8_t nextIndex_;
+  uint8_t sampleCount_;
+  float sum_;
+};
+
+MovingAverageFilter leftDistanceFilter;
+MovingAverageFilter frontDistanceFilter;
+MovingAverageFilter rightDistanceFilter;
+MovingAverageFilter centeringErrorFilter;
 
 class CenteringPidController {
  public:
@@ -153,6 +214,10 @@ CenteringPidController centeringPid(
     MAX_PID_CORRECTION,
     MAX_INTEGRAL_ERROR);
 
+bool stopIndicatorActive = false;
+bool stopIndicatorState = false;
+unsigned long lastStopBlinkMs = 0;
+
 // =====================================================
 //                    PWM FUNCTIONS
 // =====================================================
@@ -167,6 +232,44 @@ void setupPwm() {
   ledcAttachPin(RIGHT_EN, RIGHT_PWM_CHANNEL);
   ledcAttachPin(LEFT_EN, LEFT_PWM_CHANNEL);
 #endif
+}
+
+void detachRightPwm() {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcDetach(RIGHT_EN);
+#else
+  ledcDetachPin(RIGHT_EN);
+#endif
+}
+
+void updateStopIndicator(bool motorsStopped) {
+  const unsigned long nowMs = millis();
+
+  if (!motorsStopped) {
+    if (stopIndicatorActive) {
+      // GPIO2 was temporarily used as an LED. Restore its motor PWM output.
+      digitalWrite(STOP_STATUS_LED_PIN, LOW);
+      setupPwm();
+      stopIndicatorActive = false;
+      stopIndicatorState = false;
+    }
+    return;
+  }
+
+  if (!stopIndicatorActive) {
+    stopIndicatorActive = true;
+    stopIndicatorState = false;
+    lastStopBlinkMs = nowMs;
+    detachRightPwm();
+    pinMode(STOP_STATUS_LED_PIN, OUTPUT);
+    digitalWrite(STOP_STATUS_LED_PIN, LOW);
+  }
+
+  if (nowMs - lastStopBlinkMs >= STOP_BLINK_INTERVAL_MS) {
+    lastStopBlinkMs = nowMs;
+    stopIndicatorState = !stopIndicatorState;
+    digitalWrite(STOP_STATUS_LED_PIN, stopIndicatorState ? HIGH : LOW);
+  }
 }
 
 void writePwm(int pin, int duty) {
@@ -248,7 +351,7 @@ float readDistanceCm(int trigPin, int echoPin) {
 
   const unsigned long duration = pulseIn(echoPin, HIGH, ECHO_TIMEOUT_US);
   if (duration == 0) {
-    return -1.0f;
+    return SENSOR_ERROR_DISTANCE_CM;
   }
 
   return (duration * SOUND_SPEED_CM_PER_US) / 2.0f;
@@ -257,22 +360,30 @@ float readDistanceCm(int trigPin, int echoPin) {
 SensorReadings readSensors() {
   SensorReadings readings;
 
-  readings.leftCm = readDistanceCm(LEFT_TRIG, LEFT_ECHO);
+  readings.leftCm = leftDistanceFilter.update(
+      readDistanceCm(LEFT_TRIG, LEFT_ECHO));
   delay(SENSOR_SETTLE_MS);
-  readings.frontCm = readDistanceCm(FRONT_TRIG, FRONT_ECHO);
+  readings.frontCm = frontDistanceFilter.update(
+      readDistanceCm(FRONT_TRIG, FRONT_ECHO));
   delay(SENSOR_SETTLE_MS);
-  readings.rightCm = readDistanceCm(RIGHT_TRIG, RIGHT_ECHO);
+  readings.rightCm = rightDistanceFilter.update(
+      readDistanceCm(RIGHT_TRIG, RIGHT_ECHO));
 
   return readings;
 }
 
+bool isValidDistance(float distanceCm) {
+  return distanceCm > 0.0f && distanceCm <= MAX_VALID_DISTANCE_CM;
+}
+
 bool hasValidSideReadings(const SensorReadings &readings) {
-  return readings.leftCm > 0.0f && readings.rightCm > 0.0f;
+  return isValidDistance(readings.leftCm) &&
+         isValidDistance(readings.rightCm);
 }
 
 bool frontObstacleDetected(const SensorReadings &readings) {
   return FRONT_STOP_DISTANCE_CM > 0.0f &&
-         readings.frontCm > 0.0f &&
+         isValidDistance(readings.frontCm) &&
          readings.frontCm <= FRONT_STOP_DISTANCE_CM;
 }
 
@@ -280,8 +391,8 @@ void printSensor(const char *name, float distanceCm) {
   Serial.print(name);
   Serial.print(": ");
 
-  if (distanceCm < 0.0f) {
-    Serial.print("NO ECHO");
+  if (!isValidDistance(distanceCm)) {
+    Serial.print("INVALID");
   } else {
     Serial.print(distanceCm, 1);
     Serial.print(" cm");
@@ -347,7 +458,9 @@ void loop() {
 
   if (!DRIVE_ON_START || frontObstacleDetected(readings)) {
     centeringPid.reset();
+    centeringErrorFilter.reset();
     stopMotors();
+    updateStopIndicator(true);
     if (frontObstacleDetected(readings)) {
       Serial.println(F("FRONT OBSTACLE: motors stopped"));
     }
@@ -355,18 +468,25 @@ void loop() {
     // Positive error means the robot is closer to the right wall.
     // Positive correction slows the left motor and speeds up the right motor,
     // steering the robot left toward the corridor center.
-    const float errorCm = readings.leftCm - readings.rightCm;
+    const float rawErrorCm = readings.leftCm - readings.rightCm;
+    const float errorCm = centeringErrorFilter.updateError(rawErrorCm);
     const float correction = centeringPid.update(errorCm, millis());
 
+    updateStopIndicator(false);
     driveCentered(correction);
 
+    Serial.print(F("RAW ERROR: "));
+    Serial.print(rawErrorCm, 2);
+    Serial.print(F(" cm, "));
     Serial.print(F("ERROR: "));
     Serial.print(errorCm, 2);
     Serial.print(F(" cm, CORRECTION: "));
     Serial.println(correction, 2);
   } else {
     centeringPid.reset();
+    centeringErrorFilter.reset();
     stopMotors();
+    updateStopIndicator(true);
     Serial.println(F("INVALID SIDE READING: motors stopped"));
   }
 
